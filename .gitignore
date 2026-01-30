@@ -1,0 +1,22 @@
+# Data folders (Local & Server)
+unimer_raw/
+unimer_mini/
+data_ready/
+final_data/
+raw_data/
+
+# Model artifacts
+*.pt
+checkpoints/
+wandb/
+
+# Python & Environment
+__pycache__/
+*.pyc
+venv/
+.env
+.DS_Store
+
+# Archives
+*.zip
+*.tar.gz
