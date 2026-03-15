@@ -1,8 +1,46 @@
 import torch
+import torch.nn.functional as F
 import torchvision.transforms as T
 from PIL import Image
 from .model import MobileOneStudent
 from .tokenizer import LatexTokenizer
+
+
+def beam_search_decode(model, img_tensor, tokenizer, beam_size=3, max_len=128):
+    """Beam search decoding: maintain top-k hypotheses by cumulative log prob, stop on EOS."""
+    device = img_tensor.device
+    sos_id = tokenizer.sos_id
+    eos_id = tokenizer.eos_id
+    beams = [([sos_id], 0.0)]
+    for _ in range(max_len - 1):
+        all_seqs = [b[0] for b in beams]
+        batch_tokens = torch.tensor(all_seqs, dtype=torch.long, device=device)
+        batch_imgs = img_tensor.expand(len(beams), -1, -1, -1)
+        with torch.no_grad():
+            logits = model(batch_imgs, batch_tokens)
+        log_probs = F.log_softmax(logits[:, -1], dim=-1)
+        candidates = []
+        for i, (seq, score) in enumerate(beams):
+            if seq[-1] == eos_id:
+                candidates.append((seq, score))
+                continue
+            for v in range(log_probs.size(1)):
+                candidates.append((seq + [v], (score + log_probs[i, v].item()) / ((len(seq) + 1) ** 0.6)))
+        candidates.sort(key=lambda x: -x[1])
+        beams = candidates[:beam_size]
+        if all(b[0][-1] == eos_id for b in beams):
+            break
+    best = beams[0][0]
+    return tokenizer.decode(best)
+
+
+def resize_with_aspect(image, target_height=128, width_multiple=32):
+    """Resize image preserving aspect ratio, then pad width to multiple (matches training)."""
+    w, h = image.size
+    new_h = target_height
+    new_w = int(w * (new_h / h))
+    new_w = ((new_w + width_multiple - 1) // width_multiple) * width_multiple
+    return image.resize((new_w, new_h), Image.Resampling.BILINEAR)
 
 
 class LatexPredictor:
@@ -25,41 +63,27 @@ class LatexPredictor:
         if hasattr(self.model, "reparameterize"):
             self.model.reparameterize()  # Critical for MobileOne Speed
 
-        # Preprocessing
+        # Preprocessing (resize in predict; ImageNet norm to match training)
         self.transform = T.Compose([
             T.Grayscale(num_output_channels=3),
-            T.Resize((128, 384)),  # Use fixed size for simple testing
             T.ToTensor(),
+            T.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225],
+            ),
         ])
 
-    def predict(self, image_path):
+    def predict(self, image_path, max_len=128, beam_size=3):
         image = Image.open(image_path).convert("RGB")
+        image = resize_with_aspect(image, target_height=128, width_multiple=32)
         img_tensor = self.transform(image).unsqueeze(0).to(self.device)
-
-        with torch.no_grad():
-            # Forward Pass
-            logits = self.model(img_tensor)  # [1, Seq, Vocab]
-
-            # Greedy Decode (Argmax)
-            # This assumes CTC-like behavior where we pick the best token per frame
-            preds = logits.argmax(dim=2)  # [1, Seq]
-
-            # Convert IDs to Tokens
-            tokens = []
-            prev_token = None
-            for idx in preds[0]:
-                token_id = idx.item()
-                token = self.tokenizer.id2token.get(token_id, "")
-
-                # Simple logic: skip pads, specials, and duplicates (if desired)
-                if token in ["<pad>", "<sos>", "<eos>", "<unk>"]:
-                    continue
-                # Optional: Dedup for CTC (only add if different from prev)
-                # if token_id != prev_token:
-                tokens.append(token)
-                prev_token = token_id
-
-            return " ".join(tokens)
+        return beam_search_decode(
+            self.model,
+            img_tensor,
+            self.tokenizer,
+            beam_size=beam_size,
+            max_len=max_len,
+        )
 
 
 # CLI usage

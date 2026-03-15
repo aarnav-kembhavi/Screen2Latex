@@ -12,6 +12,7 @@ from typing import Optional
 try:
     import torch
     import torch.nn as nn
+    import torch.nn.functional as F
     from torch.cuda.amp import GradScaler, autocast
     from torch.utils.data import DataLoader
 except ImportError as e:
@@ -19,12 +20,15 @@ except ImportError as e:
 
 try:
     from src.model import MobileOneStudent
-    from src.dataset import MathDataset, collate_fn_pad
+    from src.dataset import MathDataset, WebFormulaDataset, collate_fn_pad
     from src.tokenizer import LatexTokenizer
 except ImportError:
     from model import MobileOneStudent
-    from dataset import MathDataset, collate_fn_pad
+    from dataset import MathDataset, WebFormulaDataset, collate_fn_pad
     from tokenizer import LatexTokenizer
+
+# Stage -> max samples for progressive scaling
+STAGE_MAX_SAMPLES = {"stage1": 50_000, "stage2": 200_000, "stage3": 500_000, "stage4": None}
 
 
 def _get_device() -> torch.device:
@@ -49,6 +53,15 @@ def train(
     checkpoint_every: int = 5,
     use_amp: bool = True,
     num_workers: int = 4,
+    teacher_checkpoint: Optional[str] = None,
+    distill_alpha: float = 0.5,
+    distill_temp: float = 2.0,
+    shards_dir: Optional[str] = None,
+    max_samples: Optional[int] = None,
+    stage: Optional[str] = None,
+    freeze_backbone: bool = False,
+    unfreeze_epoch: Optional[int] = None,
+    curriculum: bool = False,
 ) -> None:
     """
     Production training: TSV labels, real images, AMP, checkpoint every N epochs.
@@ -66,66 +79,187 @@ def train(
     vocab_size = tokenizer.vocab_size
     pad_id = tokenizer.pad_id
 
-    # Dataset and loader: root_dir = data dir (train.txt, images/) or explicit labels_path + image_dir
-    dataset = MathDataset(
-        root_dir=root_dir,
-        labels_path=labels_path,
-        image_dir=image_dir,
-        tokenizer=tokenizer,
-        img_height=128,
-        width_multiple=32,
-        max_len=max_len,
-        add_sos_eos=True,
-    )
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        collate_fn=partial(collate_fn_pad, pad_id=pad_id),
-        pin_memory=(device.type == "cuda"),
-    )
+    # Resolve max_samples from stage if set
+    effective_max_samples = max_samples
+    if stage is not None:
+        effective_max_samples = STAGE_MAX_SAMPLES.get(stage, effective_max_samples)
+
+    # Dataset: WebDataset shards if present, else fallback to MathDataset
+    use_webdataset = False
+    if shards_dir is not None and Path(shards_dir).exists():
+        shard_files = sorted(Path(shards_dir).glob("*.tar"))
+        if shard_files:
+            shard_paths = [str(p) for p in shard_files]
+            try:
+                wds_dataset = WebFormulaDataset(
+                    shard_paths,
+                    tokenizer=tokenizer,
+                    img_height=128,
+                    width_multiple=32,
+                    max_len=max_len,
+                    add_sos_eos=True,
+                )
+                dataset = wds_dataset.iterable_dataset(max_samples=effective_max_samples)
+                use_webdataset = True
+                print(f"Using WebDataset: {len(shard_paths)} shards, max_samples={effective_max_samples}")
+            except Exception as e:
+                print(f"WebDataset fallback to files: {e}")
+    if not use_webdataset:
+        dataset = MathDataset(
+            root_dir=root_dir,
+            labels_path=labels_path,
+            image_dir=image_dir,
+            tokenizer=tokenizer,
+            img_height=128,
+            width_multiple=32,
+            max_len=max_len,
+            add_sos_eos=True,
+        )
+        loader_kw = dict(
+            dataset=dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            collate_fn=partial(collate_fn_pad, pad_id=pad_id),
+            pin_memory=(device.type == "cuda"),
+            persistent_workers=(num_workers > 0),
+            prefetch_factor=4 if num_workers > 0 else None,
+        )
+        if loader_kw["prefetch_factor"] is None:
+            del loader_kw["prefetch_factor"]
+        loader = DataLoader(**loader_kw)
+    else:
+        loader_kw = dict(
+            dataset=dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            collate_fn=partial(collate_fn_pad, pad_id=pad_id),
+            pin_memory=True,
+            persistent_workers=(num_workers > 0),
+        )
+        if num_workers > 0:
+            loader_kw["prefetch_factor"] = 4
+        loader = DataLoader(**loader_kw)
 
     # Model and optimizer
     model = MobileOneStudent(vocab_size=vocab_size).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-    criterion = nn.CrossEntropyLoss(ignore_index=pad_id)
+    try:
+        model = torch.compile(model)
+    except Exception:
+        pass
+    if freeze_backbone:
+        for p in model.encoder.parameters():
+            p.requires_grad = False
+        print("Encoder backbone frozen (use --unfreeze-epoch to unfreeze later)")
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=lr,
+        weight_decay=1e-4,
+        betas=(0.9, 0.98),
+    )
+    criterion = nn.CrossEntropyLoss(
+        ignore_index=pad_id,
+        label_smoothing=0.1,
+    )
+    try:
+        total_steps = max_epochs * len(loader)
+    except TypeError:
+        total_steps = max_epochs * 5000
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=total_steps,
+    )
     scaler = GradScaler() if (use_amp and device.type == "cuda") else None
+
+    # Optional teacher for knowledge distillation
+    teacher = None
+    if teacher_checkpoint is not None and Path(teacher_checkpoint).exists():
+        teacher = MobileOneStudent(vocab_size=vocab_size).to(device)
+        ckpt = torch.load(teacher_checkpoint, map_location=device)
+        state = ckpt.get("model_state_dict", ckpt)
+        teacher.load_state_dict(state)
+        teacher.eval()
+        for p in teacher.parameters():
+            p.requires_grad = False
+        print(f"Teacher loaded from {teacher_checkpoint}, distill_alpha={distill_alpha}, distill_temp={distill_temp}")
 
     save_path = Path(save_dir)
     save_path.mkdir(parents=True, exist_ok=True)
 
     model.train()
     for epoch in range(1, max_epochs + 1):
+        # Unfreeze backbone at specified epoch
+        if freeze_backbone and unfreeze_epoch is not None and epoch == unfreeze_epoch:
+            for p in model.encoder.parameters():
+                p.requires_grad = True
+            print(f"Epoch {epoch}: encoder unfrozen")
+
+        # Sequence length curriculum: epoch < 3 -> 64, < 8 -> 96, else 128
+        epoch_max_len = max_len
+        if curriculum:
+            epoch_max_len = 64 if epoch < 3 else (96 if epoch < 8 else 128)
+
         running_loss = 0.0
         num_batches = 0
         for images, labels, _ in loader:
-            # images: [B, 3, H, W], labels: [B, L]
+            # images: [B, 3, H, W], labels: [B, L] (<sos> t1 t2 ... tN <eos>)
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
 
+            # Teacher forcing; optionally truncate to curriculum max_len
+            if curriculum and epoch_max_len < labels.size(1):
+                labels = labels[:, : epoch_max_len + 1]
+            tgt_input = labels[:, :-1]
+            tgt_output = labels[:, 1:]
+
             optimizer.zero_grad(set_to_none=True)
-            # Forward: optional AMP (BF16 or FP16)
+            # Forward and loss: autocast inside block for AMP (BF16 on A100, FP16 otherwise)
             if use_amp and device.type == "cuda":
                 with autocast(dtype=torch.bfloat16 if use_bfloat16 else torch.float16):
-                    logits = model(images)
-                    # logits: [B, Seq_Len, vocab_size]; Seq_Len from CNN width (variable per batch)
-                    seq_len = min(logits.size(1), labels.size(1))
-                    # Flatten to [B*Seq_Len, vocab_size] and [B*Seq_Len] for CrossEntropyLoss
+                    logits = model(images, tgt_input)
+                    seq_len = min(logits.size(1), tgt_output.size(1))
                     logits_flat = logits[:, :seq_len].reshape(-1, vocab_size)
-                    labels_flat = labels[:, :seq_len].reshape(-1)
-                    loss = criterion(logits_flat, labels_flat)
+                    labels_flat = tgt_output[:, :seq_len].reshape(-1)
+                    ce_loss = criterion(logits_flat, labels_flat)
+                    if teacher is not None:
+                        with torch.no_grad():
+                            teacher_logits = teacher(images, tgt_input)
+                        teacher_logits_flat = teacher_logits[:, :seq_len].reshape(-1, vocab_size)
+                        T_val = distill_temp
+                        student_log_probs = F.log_softmax(logits_flat / T_val, dim=-1)
+                        teacher_probs = F.softmax(teacher_logits_flat / T_val, dim=-1)
+                        kd_loss = F.kl_div(student_log_probs, teacher_probs, reduction="batchmean") * (T_val * T_val)
+                        loss = distill_alpha * ce_loss + (1.0 - distill_alpha) * kd_loss
+                    else:
+                        loss = ce_loss
                 scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 scaler.step(optimizer)
                 scaler.update()
+                scheduler.step()
             else:
-                logits = model(images)
-                seq_len = min(logits.size(1), labels.size(1))
+                logits = model(images, tgt_input)
+                seq_len = min(logits.size(1), tgt_output.size(1))
                 logits_flat = logits[:, :seq_len].reshape(-1, vocab_size)
-                labels_flat = labels[:, :seq_len].reshape(-1)
-                loss = criterion(logits_flat, labels_flat)
+                labels_flat = tgt_output[:, :seq_len].reshape(-1)
+                ce_loss = criterion(logits_flat, labels_flat)
+                if teacher is not None:
+                    with torch.no_grad():
+                        teacher_logits = teacher(images, tgt_input)
+                    teacher_logits_flat = teacher_logits[:, :seq_len].reshape(-1, vocab_size)
+                    T_val = distill_temp
+                    student_log_probs = F.log_softmax(logits_flat / T_val, dim=-1)
+                    teacher_probs = F.softmax(teacher_logits_flat / T_val, dim=-1)
+                    kd_loss = F.kl_div(student_log_probs, teacher_probs, reduction="batchmean") * (T_val * T_val)
+                    loss = distill_alpha * ce_loss + (1.0 - distill_alpha) * kd_loss
+                else:
+                    loss = ce_loss
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
+                scheduler.step()
 
             running_loss += loss.item()
             num_batches += 1
@@ -162,12 +296,23 @@ def main():
     p.add_argument("--checkpoint-every", type=int, default=5, help="Save checkpoint every N epochs")
     p.add_argument("--no-amp", action="store_true", help="Disable AMP")
     p.add_argument("--num-workers", type=int, default=4, help="DataLoader workers")
+    p.add_argument("--teacher-checkpoint", type=str, default=None, help="Teacher checkpoint for knowledge distillation")
+    p.add_argument("--distill-alpha", type=float, default=0.5, help="Weight for CE loss in distillation (loss = alpha*CE + (1-alpha)*KD)")
+    p.add_argument("--distill-temp", type=float, default=2.0, help="Temperature for distillation softmax")
+    p.add_argument("--shards-dir", type=str, default=None, help="WebDataset shards dir (default: data-dir/shards); used if *.tar present")
+    p.add_argument("--max-samples", type=int, default=None, help="Limit samples per epoch (WebDataset with_epoch)")
+    p.add_argument("--stage", type=str, default=None, choices=("stage1", "stage2", "stage3", "stage4"),
+                   help="Progressive scaling: stage1=50k, stage2=200k, stage3=500k, stage4=full")
+    p.add_argument("--freeze-backbone", action="store_true", help="Freeze MobileOne encoder at start")
+    p.add_argument("--unfreeze-epoch", type=int, default=None, help="Epoch at which to unfreeze encoder (use with --freeze-backbone)")
+    p.add_argument("--curriculum", action="store_true", help="Sequence length curriculum: 64->96->128 by epoch")
     args = p.parse_args()
 
     data_dir = Path(args.data_dir)
     labels_path = args.labels or str(data_dir / "train.txt")
     image_dir = args.images or str(data_dir)
     vocab_path = args.vocab or str(data_dir / "vocab.txt")
+    shards_dir = args.shards_dir or str(data_dir / "shards")
 
     # If using data-dir only, pass root_dir so dataset uses data_dir/train.txt and data_dir/images/
     if args.labels is None and args.images is None:
@@ -190,6 +335,15 @@ def main():
         checkpoint_every=args.checkpoint_every,
         use_amp=not args.no_amp,
         num_workers=args.num_workers,
+        teacher_checkpoint=args.teacher_checkpoint,
+        distill_alpha=args.distill_alpha,
+        distill_temp=args.distill_temp,
+        shards_dir=shards_dir,
+        max_samples=args.max_samples,
+        stage=args.stage,
+        freeze_backbone=args.freeze_backbone,
+        unfreeze_epoch=args.unfreeze_epoch,
+        curriculum=args.curriculum,
     )
 
 

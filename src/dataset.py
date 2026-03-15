@@ -1,11 +1,11 @@
 """
 MathDataset: loads TSV labels (filename \\t formula) and images for Screen2LaTeX.
-UniMER-1M compatible: image dir + tab-separated labels file.
+WebFormulaDataset: WebDataset tar shards for streaming. UniMER-1M compatible.
 """
 
 import os
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 try:
     import torch
@@ -15,15 +15,19 @@ except ImportError as e:
 
 try:
     from torchvision import transforms
-    import numpy as np
     from PIL import Image
 except ImportError as e:
-    raise ImportError("torchvision, numpy, Pillow required.") from e
+    raise ImportError("torchvision, Pillow required.") from e
 
 try:
     from src.tokenizer import LatexTokenizer
 except ImportError:
     from tokenizer import LatexTokenizer
+
+try:
+    import webdataset as wds
+except ImportError:
+    wds = None  # pip install webdataset
 
 
 def _to_rgb(img: Image.Image) -> Image.Image:
@@ -133,6 +137,105 @@ class MathDataset(Dataset):
         ids = self.tokenizer.encode(formula, max_len=self.max_len, add_sos_eos=self.add_sos_eos)
         label_tensor = torch.tensor(ids, dtype=torch.long)
         return image_tensor, label_tensor
+
+
+def _webdataset_preprocess(
+    sample,
+    tokenizer: LatexTokenizer,
+    img_height: int,
+    width_multiple: int,
+    max_len: Optional[int],
+    add_sos_eos: bool,
+    to_tensor: Callable,
+    normalize: Callable,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Map (PIL image, formula bytes) -> (image_tensor, label_tensor) for WebDataset."""
+    image, formula_bytes = sample[0], sample[1]
+    formula = formula_bytes.decode("utf-8") if isinstance(formula_bytes, bytes) else formula_bytes
+    image = _to_rgb(image)
+    w, h = image.size
+    new_w = max(1, int(w * (img_height / h)))
+    new_w = pad_width_to_multiple(new_w, width_multiple)
+    image = image.resize((new_w, img_height), Image.Resampling.BILINEAR)
+    image_tensor = normalize(to_tensor(image))
+    ids = tokenizer.encode(formula, max_len=max_len, add_sos_eos=add_sos_eos)
+    label_tensor = torch.tensor(ids, dtype=torch.long)
+    return (image_tensor, label_tensor)
+
+
+class WebFormulaDataset:
+    """
+    WebDataset pipeline for Screen2LaTeX: tar shards -> decode images -> resize -> tokenize -> (image, label).
+    Use with DataLoader; collate_fn_pad for batching. Install: pip install webdataset
+    """
+
+    def __init__(
+        self,
+        shards,
+        tokenizer: LatexTokenizer,
+        img_height: int = 128,
+        width_multiple: int = 32,
+        max_len: Optional[int] = 128,
+        add_sos_eos: bool = True,
+    ):
+        if wds is None:
+            raise ImportError("WebDataset required for WebFormulaDataset. pip install webdataset")
+        self.shards = shards
+        self.tokenizer = tokenizer
+        self.img_height = img_height
+        self.width_multiple = width_multiple
+        self.max_len = max_len
+        self.add_sos_eos = add_sos_eos
+        self._to_tensor = transforms.ToTensor()
+        self._normalize = transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225],
+        )
+
+    def _build_pipeline(self, max_samples: Optional[int] = None):
+        def preprocess(sample):
+            return _webdataset_preprocess(
+                sample,
+                self.tokenizer,
+                self.img_height,
+                self.width_multiple,
+                self.max_len,
+                self.add_sos_eos,
+                self._to_tensor,
+                self._normalize,
+            )
+
+        dataset = (
+            wds.WebDataset(self.shards, resampled=True)
+            .repeat()
+            .decode("pil")
+            .to_tuple("jpg", "txt")
+            .shuffle(10000)
+            .map(preprocess)
+        )
+        if max_samples is not None:
+            dataset = dataset.with_epoch(max_samples)
+        return dataset
+
+    def pipeline(self, max_samples: Optional[int] = None):
+        """Return pipeline (single-use iterator). For multi-epoch training use iterable_dataset()."""
+        return self._build_pipeline(max_samples)
+
+    def iterable_dataset(self, max_samples: Optional[int] = None) -> "WebFormulaIterableDataset":
+        """Return an IterableDataset that creates a fresh pipeline each epoch (for DataLoader)."""
+        return WebFormulaIterableDataset(self, max_samples)
+
+
+class WebFormulaIterableDataset(torch.utils.data.IterableDataset):
+    """Wraps WebFormulaDataset so each epoch gets a fresh pipeline (DataLoader calls __iter__ per epoch)."""
+
+    def __init__(self, wds_dataset: WebFormulaDataset, max_samples: Optional[int] = None):
+        super().__init__()
+        self._wds_dataset = wds_dataset
+        self._max_samples = max_samples
+
+    def __iter__(self):
+        return iter(self._wds_dataset._build_pipeline(self._max_samples))
 
 
 def collate_fn_pad(batch: list, pad_id: int = 0) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
