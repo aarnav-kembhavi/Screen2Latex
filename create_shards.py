@@ -12,7 +12,7 @@ import webdataset as wds
 
 
 SHARDS_DIR = "data_ready/shards"
-SAMPLES_PER_SHARD = 10000
+SAMPLES_PER_SHARD = 50000
 
 
 def main():
@@ -45,7 +45,7 @@ def main():
         if img is None:
             continue
         buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=95)
+        img.save(buf, format="PNG")
         image_bytes = buf.getvalue()
         latex_string = label if isinstance(label, str) else (label.decode("utf-8") if isinstance(label, bytes) else "")
         sample = {
