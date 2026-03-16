@@ -2,39 +2,56 @@
 
 ## 1. Setup on Server
 ```bash
-# Clone the repo (Use your PAT if private)
 git clone https://github.com/YOUR_USERNAME/screen2latex.git
 cd screen2latex
 
-# Install dependencies
 pip install -r requirements.txt
 ```
 
-## 2. Download Data
-The server has fast internet. Download the UniMER-1M dataset directly here.
+## 2. Create WebDataset Shards
+Download UniMER from HuggingFace and write tar shards (no individual image files).
 
 ```bash
-# Downloads images to ./raw_data
-python download_data.py --out-dir ./raw_data
+# Writes data_ready/shards/shard-000000.tar, shard-000001.tar, ... (5000 samples each)
+python create_shards.py --out-dir data_ready/shards
 ```
 
-## 3. Prepare Data
-Resize images to 128px height using the server CPU.
+Optional: `--max-samples N` to limit samples, `--shard-size N` to change samples per shard (default 5000).
 
-```bash
-# Processes ./raw_data -> ./final_data
-python prepare_data.py --raw-dir ./raw_data --out-dir ./final_data
-```
+## 3. Vocab
+Training requires `data_ready/vocab.txt` (one token per line). Build it from your formula corpus or use a pre-made LaTeX token vocab.
 
 ## 4. Run Training (A100)
-Run inside tmux to prevent disconnects.
+Training uses only WebDataset shards. It will raise a clear error if `data_ready/shards/` is missing or empty.
 
 ```bash
 tmux new -s training
 
-# Start Training (Adjust batch size if needed, A100 supports 128+)
-python src/train.py --data-dir ./final_data --batch-size 128 --epochs 10
+python src/train.py --data-dir ./data_ready --batch-size 128 --epochs 10
 
 # Detach: Ctrl+B, then D
 # Re-attach: tmux attach -t training
+```
+
+Shards path: `--shards-dir` (default `data-dir/shards`). Checkpoints go to `--save-dir` (default `checkpoints`).
+
+## 5. Inference
+```bash
+python src/inference.py path/to/image.png
+```
+Uses GPU by default if available. Requires `checkpoints/best_model.pt` and `vocab.txt` (e.g. `data_ready/vocab.txt`).
+
+## Project Structure
+```
+Screen2Latex
+├── src
+│   ├── model.py
+│   ├── train.py
+│   ├── dataset.py
+│   ├── inference.py
+│   └── tokenizer.py
+├── create_shards.py
+├── data_ready
+│   └── shards
+└── checkpoints
 ```

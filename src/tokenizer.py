@@ -13,8 +13,8 @@ EOS = "<eos>"
 UNK = "<unk>"
 SPECIAL_TOKENS = [PAD, SOS, EOS, UNK]
 
-# Regex: \\command or single non-space character
-TOKEN_PATTERN = re.compile(r"\\[a-zA-Z]+|[^ \t\n]")
+# Regex: letters, dot, braces/underscore/caret, or single non-space character
+TOKEN_PATTERN = re.compile(r"[a-zA-Z]+|\.|[{}_^]|[^ \t\n]")
 
 
 class LatexTokenizer:
@@ -47,18 +47,15 @@ class LatexTokenizer:
         path = Path(path)
         if not path.exists():
             raise FileNotFoundError(f"Vocab file not found: {path}")
+        tokens = []
         with open(path, "r", encoding="utf-8") as f:
-            for i, line in enumerate(f):
-                t = line.strip()
-                if t:
-                    self.token2id[t] = i
-                    self.id2token[i] = t
-        # Ensure special tokens exist
+            tokens = [line.strip() for line in f if line.strip()]
         for t in SPECIAL_TOKENS:
-            if t not in self.token2id:
-                idx = len(self.token2id)
-                self.token2id[t] = idx
-                self.id2token[idx] = t
+            if t not in tokens:
+                tokens.insert(0, t)
+        for i, t in enumerate(tokens):
+            self.token2id[t] = i
+            self.id2token[i] = t
 
     @property
     def vocab_size(self) -> int:
@@ -94,9 +91,13 @@ class LatexTokenizer:
         if add_sos_eos:
             ids = [self.sos_id] + ids + [self.eos_id]
         if max_len is not None:
-            if len(ids) > max_len:
-                ids = ids[:max_len]
+            if add_sos_eos:
+                max_tokens = max_len - 2
+                ids = ids[1:-1][:max_tokens]
+                ids = [self.sos_id] + ids + [self.eos_id]
             else:
+                ids = ids[:max_len]
+            if len(ids) < max_len:
                 ids = ids + [self.pad_id] * (max_len - len(ids))
         return ids
 
@@ -108,7 +109,7 @@ class LatexTokenizer:
         tokens = []
         for i in ids:
             t = self.id2token.get(i, UNK)
-            if skip_special and t in SPECIAL_TOKENS:
+            if skip_special and t in {PAD, SOS, EOS}:
                 if t == EOS:
                     break
                 continue

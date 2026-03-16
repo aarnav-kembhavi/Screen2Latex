@@ -1,15 +1,13 @@
 """
-MathDataset: loads TSV labels (filename \\t formula) and images for Screen2LaTeX.
-WebFormulaDataset: WebDataset tar shards for streaming. UniMER-1M compatible.
+WebDataset pipeline for Screen2LaTeX: tar shards (jpg + txt) -> decode, resize, tokenize.
+UniMER-1M compatible. No legacy train.txt or image-dir support.
 """
 
-import os
-from pathlib import Path
 from typing import Callable, Optional, Tuple
 
 try:
     import torch
-    from torch.utils.data import Dataset
+    from torch.utils.data import IterableDataset
 except ImportError as e:
     raise ImportError("PyTorch is required. Install with: pip install torch") from e
 
@@ -40,103 +38,6 @@ def _to_rgb(img: Image.Image) -> Image.Image:
 def pad_width_to_multiple(w: int, multiple: int = 32) -> int:
     """Return smallest width >= w that is multiple of `multiple`."""
     return ((w + multiple - 1) // multiple) * multiple
-
-
-class MathDataset(Dataset):
-    """
-    Dataset of (image, formula) for Screen2LaTeX.
-    Labels file: tab-separated (filename \\t formula) per line.
-    Images resolved relative to root_dir (e.g. root_dir/images/0.jpg when file says images/0.jpg).
-    """
-
-    def __init__(
-        self,
-        root_dir: Optional[str] = None,
-        labels_path: Optional[str] = None,
-        image_dir: Optional[str] = None,
-        tokenizer: Optional[LatexTokenizer] = None,
-        img_height: int = 128,
-        width_multiple: int = 32,
-        max_len: Optional[int] = None,
-        add_sos_eos: bool = True,
-    ):
-        """
-        Args:
-            root_dir: If set, labels at {root_dir}/train.txt and images at {root_dir}/{filename}.
-            labels_path: Path to TSV (overrides root_dir/train.txt if both given).
-            image_dir: Directory for images (overrides root_dir if both given).
-            tokenizer: LatexTokenizer for encode/decode.
-            img_height: Target height (width computed to preserve aspect, then padded).
-            width_multiple: Pad image width to multiple of this (e.g. 32 for CNN).
-            max_len: Max sequence length for labels (None = no cap).
-            add_sos_eos: If True, tokenizer.encode adds <sos> and <eos>.
-        """
-        if root_dir is not None:
-            root_dir = Path(root_dir)
-            self.root_dir = root_dir
-            _labels_path = root_dir / "train.txt"
-            self.image_dir = root_dir
-        else:
-            self.root_dir = None
-            _labels_path = Path(labels_path) if labels_path else None
-            self.image_dir = Path(image_dir) if image_dir else None
-        if _labels_path is None:
-            _labels_path = Path(labels_path)
-        if self.image_dir is None:
-            self.image_dir = Path(image_dir)
-        self.tokenizer = tokenizer
-        self.img_height = img_height
-        self.width_multiple = width_multiple
-        self.max_len = max_len
-        self.add_sos_eos = add_sos_eos
-
-        # Parse TSV: list of (filename, formula); filename is relative to root_dir/image_dir
-        self.samples: list[Tuple[str, str]] = []
-        with open(_labels_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                parts = line.split("\t", 1)
-                if len(parts) != 2:
-                    continue
-                filename, formula = parts[0].strip(), parts[1].strip()
-                if filename and formula:
-                    self.samples.append((filename, formula))
-
-        # Transforms: to RGB, then resize height (width computed in __getitem__), then to tensor
-        self._to_tensor = transforms.ToTensor()
-        self._normalize = transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225],
-        )
-
-    def __len__(self) -> int:
-        return len(self.samples)
-
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        filename, formula = self.samples[idx]
-        # Resolve image path: {root_dir}/images/0.jpg when filename is images/0.jpg
-        img_path = Path(self.image_dir) / filename
-        if not img_path.exists():
-            img_path = Path(self.image_dir) / os.path.basename(filename)
-        image = Image.open(img_path).convert("RGB")
-        image = _to_rgb(image)
-
-        # Resize to fixed height 128, width proportional (then pad to 32 multiple in collate or here)
-        w, h = image.size
-        new_h = self.img_height
-        new_w = max(1, int(w * (new_h / h)))
-        new_w = pad_width_to_multiple(new_w, self.width_multiple)
-        image = image.resize((new_w, new_h), Image.Resampling.BILINEAR)
-
-        image_tensor = self._to_tensor(image)
-        image_tensor = self._normalize(image_tensor)
-
-        # Encode formula to label tensor
-        ids = self.tokenizer.encode(formula, max_len=self.max_len, add_sos_eos=self.add_sos_eos)
-        label_tensor = torch.tensor(ids, dtype=torch.long)
-        return image_tensor, label_tensor
 
 
 def _webdataset_preprocess(
@@ -207,10 +108,9 @@ class WebFormulaDataset:
 
         dataset = (
             wds.WebDataset(self.shards, resampled=True)
-            .repeat()
+            .shuffle(10000)
             .decode("pil")
             .to_tuple("jpg", "txt")
-            .shuffle(10000)
             .map(preprocess)
         )
         if max_samples is not None:
@@ -226,7 +126,7 @@ class WebFormulaDataset:
         return WebFormulaIterableDataset(self, max_samples)
 
 
-class WebFormulaIterableDataset(torch.utils.data.IterableDataset):
+class WebFormulaIterableDataset(IterableDataset):
     """Wraps WebFormulaDataset so each epoch gets a fresh pipeline (DataLoader calls __iter__ per epoch)."""
 
     def __init__(self, wds_dataset: WebFormulaDataset, max_samples: Optional[int] = None):

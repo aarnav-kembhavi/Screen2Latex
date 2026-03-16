@@ -8,3 +8,4 @@ numpy
 tqdm
 huggingface_hub
 datasets
+webdataset
