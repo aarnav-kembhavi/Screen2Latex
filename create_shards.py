@@ -1,63 +1,130 @@
 """
-Download UniMER dataset from HuggingFace and write WebDataset tar shards.
-No individual image files are written; all data goes into data_ready/shards/*.tar.
+Create WebDataset shards from the UniMER dataset using HuggingFace streaming.
+
+Optimizations:
+- JPEG encoding (much faster than PNG)
+- ThreadPoolExecutor for parallel encoding
+- prefetch buffer to overlap download + encoding
+- large shards to reduce filesystem overhead
 """
 
 import io
 import os
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 
 from datasets import load_dataset
 import webdataset as wds
-
+from PIL import Image
 
 SHARDS_DIR = "data_ready/shards"
 SAMPLES_PER_SHARD = 50000
+JPEG_QUALITY = 90
+
+
+def encode_sample(index_row):
+    """Convert a dataset sample to WebDataset format."""
+    index, row = index_row
+
+    img = row.get("image") or (row.get("images", [None])[0] if row.get("images") else None)
+    label = row.get("label") or row.get("text", "") or ""
+
+    if img is None:
+        return None
+
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
+
+    buffer = io.BytesIO()
+    img.save(buffer, format="JPEG", quality=JPEG_QUALITY, optimize=False)
+
+    image_bytes = buffer.getvalue()
+
+    if isinstance(label, bytes):
+        label = label.decode("utf-8")
+
+    return {
+        "__key__": str(index),
+        "jpg": image_bytes,
+        "txt": label.encode("utf-8"),
+    }
 
 
 def main():
-    p = argparse.ArgumentParser(description="Create WebDataset shards from UniMER (HuggingFace)")
-    p.add_argument("--out-dir", type=str, default=SHARDS_DIR, help="Output directory for shard tars")
-    p.add_argument("--max-samples", type=int, default=None, help="Max samples to write (default: all)")
-    p.add_argument("--shard-size", type=int, default=SAMPLES_PER_SHARD, help="Samples per shard")
-    args = p.parse_args()
+    parser = argparse.ArgumentParser(description="Create WebDataset shards from UniMER")
+    parser.add_argument("--out-dir", type=str, default=SHARDS_DIR)
+    parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument("--shard-size", type=int, default=SAMPLES_PER_SHARD)
+    parser.add_argument("--num-workers", type=int, default=16)
+    parser.add_argument("--prefetch", type=int, default=512)
+
+    args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
-    pattern = os.path.join(args.out_dir, "shard-%06d.tar")
-    sink = wds.ShardWriter(pattern, maxcount=args.shard_size)
 
-    print("Loading UniMER dataset (streaming)...")
-    dataset = load_dataset("wanderkid/UniMER_Dataset", split="train", streaming=True)
+    shard_pattern = os.path.join(args.out_dir, "shard-%06d.tar")
+
+    sink = wds.ShardWriter(
+        shard_pattern,
+        maxcount=args.shard_size,
+        compress=False
+    )
+
+    print("Streaming UniMER dataset from HuggingFace...")
+
+    dataset = load_dataset(
+        "wanderkid/UniMER_Dataset",
+        split="train",
+        streaming=True
+    )
 
     try:
         from tqdm import tqdm
     except ImportError:
         tqdm = lambda x, **kw: x
 
-    n = 0
-    iterator = iter(dataset)
-    pbar = tqdm(iterator, total=args.max_samples, desc="Writing shards", unit=" samples")
-    for i, row in enumerate(pbar):
-        if args.max_samples is not None and n >= args.max_samples:
-            break
-        img = row.get("image") or (row.get("images", [None])[0] if row.get("images") else None)
-        label = row.get("label") or row.get("text", "") or ""
-        if img is None:
-            continue
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        image_bytes = buf.getvalue()
-        latex_string = label if isinstance(label, str) else (label.decode("utf-8") if isinstance(label, bytes) else "")
-        sample = {
-            "__key__": str(n),
-            "jpg": image_bytes,
-            "txt": latex_string.encode("utf-8"),
-        }
-        sink.write(sample)
-        n += 1
+    executor = ThreadPoolExecutor(max_workers=args.num_workers)
 
+    futures = []
+    dataset_iterator = iter(dataset)
+
+    written = 0
+    skipped = 0
+
+    progress = tqdm(total=args.max_samples, desc="Writing shards", unit="samples")
+
+    while True:
+
+        while len(futures) < args.prefetch:
+            try:
+                row = next(dataset_iterator)
+            except StopIteration:
+                break
+
+            futures.append(
+                executor.submit(encode_sample, (written + len(futures), row))
+            )
+
+        if not futures:
+            break
+
+        future = futures.pop(0)
+        result = future.result()
+
+        if result is None:
+            skipped += 1
+        else:
+            sink.write(result)
+            written += 1
+            progress.update(1)
+
+        if args.max_samples and written >= args.max_samples:
+            break
+
+    progress.close()
     sink.close()
-    print(f"Wrote {n} samples to shards in {args.out_dir}")
+
+    print(f"Wrote {written} samples ({skipped} skipped) to {args.out_dir}")
 
 
 if __name__ == "__main__":
