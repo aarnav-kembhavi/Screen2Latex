@@ -17,15 +17,12 @@ try:
 except ImportError as e:
     raise ImportError("torchvision, Pillow required.") from e
 
-try:
-    from src.tokenizer import LatexTokenizer
-except ImportError:
-    from tokenizer import LatexTokenizer
+from src.tokenizer import LatexTokenizer
 
 try:
     import webdataset as wds
 except ImportError:
-    wds = None  # pip install webdataset
+    wds = None
 
 
 def _to_rgb(img: Image.Image) -> Image.Image:
@@ -107,11 +104,11 @@ class WebFormulaDataset:
             )
 
         dataset = (
-            wds.WebDataset(self.shards, resampled=True)
-            .shuffle(10000)
+            wds.WebDataset(self.shards, resampled=False)
+            .shuffle(10000, initial=10000)
             .decode("pil")
             .to_tuple("jpg", "txt")
-            .map(preprocess)
+            .map(preprocess, handler=wds.handler.warn_and_continue)
         )
         if max_samples is not None:
             dataset = dataset.with_epoch(max_samples)
@@ -156,7 +153,7 @@ def collate_fn_pad(batch: list, pad_id: int = 0) -> Tuple[torch.Tensor, torch.Te
     for im in images:
         w = im.size(2)
         if w < max_w:
-            pad = torch.zeros(im.size(0), h, max_w - w)
+            pad = torch.zeros(im.size(0), h, max_w - w, dtype=im.dtype)
             im = torch.cat([im, pad], dim=2)
         padded_images.append(im)
     # Pad labels to max_l with pad_id

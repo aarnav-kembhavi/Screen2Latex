@@ -1,9 +1,17 @@
+import os
+import sys
+import re
+import hashlib
+import glob
 import torch
 import torch.nn.functional as F
 import torchvision.transforms as T
 from PIL import Image
-from .model import MobileOneStudent
-from .tokenizer import LatexTokenizer
+
+sys.path.insert(0, os.path.abspath(os.path.dirname(os.path.dirname(__file__))))
+
+from src.model import MobileOneStudent
+from src.tokenizer import LatexTokenizer
 
 # Length penalty exponent for beam scoring
 BEAM_LENGTH_PENALTY_ALPHA = 0.6
@@ -63,7 +71,22 @@ def resize_with_aspect(image, target_height=128, width_multiple=32):
 
 
 def _default_device():
-    return "cuda" if torch.cuda.is_available() else "cpu"
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Device: {dev}")
+    return dev
+
+
+def _latest_checkpoint(checkpoint_dir="checkpoints"):
+    """Return path to latest checkpoint by epoch number, then mtime."""
+    pattern = os.path.join(checkpoint_dir, "*.pt")
+    files = glob.glob(pattern)
+    if not files:
+        return None
+    def epoch_from_path(p):
+        m = re.search(r"epoch[_\s]*(\d+)", os.path.basename(p), re.I)
+        return int(m.group(1)) if m else 0
+    files.sort(key=lambda p: (epoch_from_path(p), os.path.getmtime(p)), reverse=True)
+    return files[0]
 
 
 class LatexPredictor:
@@ -78,6 +101,11 @@ class LatexPredictor:
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         state_dict = checkpoint.get("model_state_dict", checkpoint)
         self.model.load_state_dict(state_dict)
+        with open(vocab_file, "rb") as f:
+            current_vocab_hash = hashlib.md5(f.read()).hexdigest()
+        ckpt_vocab_hash = checkpoint.get("vocab_hash")
+        if ckpt_vocab_hash is not None and ckpt_vocab_hash != current_vocab_hash:
+            raise RuntimeError("Checkpoint vocab_hash does not match vocab file")
 
         self.model.to(self.device)
         self.model.eval()
@@ -108,5 +136,17 @@ class LatexPredictor:
 
 if __name__ == "__main__":
     import sys
-    predictor = LatexPredictor("checkpoints/best_model.pt", "vocab.txt")
+    if len(sys.argv) < 2:
+        print("Usage: python -m src.inference <image_path>")
+        sys.exit(1)
+    vocab_file = "data_ready/vocab.txt"
+    if not os.path.exists(vocab_file):
+        vocab_file = "vocab.txt"
+    ckpt = _latest_checkpoint("checkpoints")
+    if not ckpt:
+        ckpt = "checkpoints/best_model.pt"
+    if not os.path.isfile(ckpt):
+        print("No checkpoint found")
+        sys.exit(1)
+    predictor = LatexPredictor(ckpt, vocab_file)
     print(predictor.predict(sys.argv[1]))
