@@ -156,11 +156,14 @@ def encode_sample(path_label: Tuple[str, str]):
         with Image.open(path) as img:
             img = img.convert("RGB")
             MAX_WIDTH = 2048  # try 1024 if still OOM
+            print("BEFORE:", img.width, flush=True)
+
             if img.width > MAX_WIDTH:
                 scale = MAX_WIDTH / img.width
                 new_height = int(img.height * scale)
                 img = img.resize((MAX_WIDTH, new_height))
-                print("DEBUG WIDTH:", img.width, flush=True)
+
+            print("AFTER:", img.width, flush=True)
             buffer = io.BytesIO()
             img.save(buffer, format="JPEG", quality=JPEG_QUALITY, optimize=False)
         image_bytes = buffer.getvalue()
