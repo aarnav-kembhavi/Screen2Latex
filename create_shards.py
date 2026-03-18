@@ -9,6 +9,7 @@ import sys
 import json
 import hashlib
 import argparse
+print("RUNNING:", __file__)
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Tuple
 
@@ -159,6 +160,7 @@ def encode_sample(path_label: Tuple[str, str]):
                 scale = MAX_WIDTH / img.width
                 new_height = int(img.height * scale)
                 img = img.resize((MAX_WIDTH, new_height))
+                print("DEBUG WIDTH:", img.width)
             buffer = io.BytesIO()
             img.save(buffer, format="JPEG", quality=JPEG_QUALITY, optimize=False)
         image_bytes = buffer.getvalue()
