@@ -244,8 +244,8 @@ def train(
                         teacher_probs = F.softmax(teacher_logits_flat / T_val, dim=-1)
                         kd_loss = F.kl_div(student_log_probs, teacher_probs, reduction="batchmean") * (T_val * T_val)
                         loss = distill_alpha * ce_loss + (1.0 - distill_alpha) * kd_loss
-                else:
-                    loss = ce_loss
+                    else:
+                        loss = ce_loss
                 if not torch.isfinite(loss).all():
                     print(f"Warning: non-finite loss at epoch {epoch}, batch {num_batches + 1}. Stopping.")
                     stop_training = True
