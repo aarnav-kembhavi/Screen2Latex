@@ -108,7 +108,7 @@ class WebFormulaDataset:
             .shuffle(10000, initial=10000)
             .decode("pil")
             .to_tuple("jpg", "txt")
-            .map(preprocess, handler=wds.handler.warn_and_continue)
+            .map(preprocess, handler=wds.handlers.warn_and_continue)
         )
         if max_samples is not None:
             dataset = dataset.with_epoch(max_samples)
