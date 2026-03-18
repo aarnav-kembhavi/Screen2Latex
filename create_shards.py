@@ -33,23 +33,77 @@ def collect_dataset(root_dir: str) -> List[Tuple[str, str]]:
     train_txt = os.path.join(root_dir, TRAIN_TXT)
     if os.path.isfile(train_txt):
         with open(train_txt, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
+            lines = [line.strip() for line in f if line.strip()]
+
+        # Detect format
+        first_line = lines[0]
+        parts = first_line.split(maxsplit=1)
+
+        is_path_label = (
+            len(parts) == 2
+            and (
+                parts[0].endswith(".png")
+                or parts[0].endswith(".jpg")
+                or parts[0].endswith(".jpeg")
+            )
+        )
+
+        if is_path_label:
+            print("Detected train.txt format: path + label")
+            for line in lines:
                 parts = line.split(maxsplit=1)
                 if len(parts) != 2:
                     continue
                 rel_path, label = parts[0].strip(), parts[1].strip()
+
                 if not label or len(label) < 3 or len(label) > 512:
                     continue
                 try:
                     label.encode("utf-8")
                 except (UnicodeEncodeError, UnicodeDecodeError):
                     continue
+
                 img_path = os.path.join(root_dir, rel_path)
+
+                if not os.path.isfile(img_path):
+                    img_path = os.path.join(root_dir, "images", rel_path)
+
                 if os.path.isfile(img_path):
                     samples.append((img_path, label))
+        else:
+            print("Detected train.txt format: label-only → using index alignment")
+
+            images_dir = os.path.join(root_dir, "images")
+            if not os.path.isdir(images_dir):
+                raise RuntimeError("images/ directory not found for label-only dataset")
+
+            image_files = sorted(
+                [
+                    f
+                    for f in os.listdir(images_dir)
+                    if f.lower().endswith((".png", ".jpg", ".jpeg"))
+                ]
+            )
+
+            n = min(len(image_files), len(lines))
+
+            if n == 0:
+                raise RuntimeError("No valid image/label pairs after alignment")
+
+            print(f"Aligning {n} samples (images ↔ labels)")
+
+            for i in range(n):
+                img_path = os.path.join(images_dir, image_files[i])
+                label = lines[i]
+
+                if not label or len(label) < 3 or len(label) > 512:
+                    continue
+                try:
+                    label.encode("utf-8")
+                except (UnicodeEncodeError, UnicodeDecodeError):
+                    continue
+
+                samples.append((img_path, label))
         print(f"Found {len(samples)} samples (from {TRAIN_TXT})")
         return samples
 
@@ -82,7 +136,7 @@ def collect_dataset(root_dir: str) -> List[Tuple[str, str]]:
                         print("Warning:", e)
                         label = ""
 
-            if not isinstance(label, str) or not label or len(label) < 3 or len(label) > 512:
+            if not isinstance(label, str) or not label or len(label) < 3 or len(label) > 2000:
                 continue
             try:
                 label.encode("utf-8")
