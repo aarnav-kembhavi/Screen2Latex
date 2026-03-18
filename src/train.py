@@ -18,6 +18,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
+import warnings
+warnings.filterwarnings("ignore")
 
 from src.model import MobileOneStudent
 from src.dataset import WebFormulaDataset, collate_fn_pad
@@ -168,10 +170,7 @@ def train(
     print(f"Sample batch: image shape {images.shape}, label shape {labels.shape}")
 
     model = MobileOneStudent(vocab_size=vocab_size, pad_id=pad_id).to(device)
-    try:
-        model = torch.compile(model)
-    except Exception as e:
-        print("Warning:", e)
+    # model = torch.compile(model)  # disabled due to VRAM issues
     if freeze_backbone:
         for p in model.encoder.parameters():
             p.requires_grad = False
@@ -220,6 +219,9 @@ def train(
         num_batches = 0
         stop_training = False
         for images, labels, _ in loader:
+            if num_batches % 20 == 0:
+                print(f"[Epoch {epoch}] Batch {num_batches} | loss={running_loss / max(1, num_batches):.4f}")
+
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
             if curriculum and epoch_max_len < labels.size(1):
