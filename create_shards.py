@@ -160,7 +160,7 @@ def encode_sample(path_label: Tuple[str, str]):
                 scale = MAX_WIDTH / img.width
                 new_height = int(img.height * scale)
                 img = img.resize((MAX_WIDTH, new_height))
-                print("DEBUG WIDTH:", img.width)
+                print("DEBUG WIDTH:", img.width, flush=True)
             buffer = io.BytesIO()
             img.save(buffer, format="JPEG", quality=JPEG_QUALITY, optimize=False)
         image_bytes = buffer.getvalue()
