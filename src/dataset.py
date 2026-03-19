@@ -60,7 +60,7 @@ def _webdataset_preprocess(
     ids = tokenizer.encode(formula, max_len=max_len, add_sos_eos=add_sos_eos)
     label_tensor = torch.tensor(ids, dtype=torch.long)
     return (image_tensor, label_tensor)
-    
+
 class WebFormulaDataset:
     """
     WebDataset pipeline for Screen2LaTeX: tar shards -> decode images -> resize -> tokenize -> (image, label).
@@ -105,7 +105,7 @@ class WebFormulaDataset:
 
         dataset = (
             wds.WebDataset(self.shards, resampled=False)
-            .shuffle(10000, initial=10000)
+            .shuffle(2000, initial=2000)
             .decode("pil")
             .to_tuple("jpg", "txt")
             .map(preprocess, handler=wds.handlers.warn_and_continue)
