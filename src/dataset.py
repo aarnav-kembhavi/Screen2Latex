@@ -53,14 +53,14 @@ def _webdataset_preprocess(
     image = _to_rgb(image)
     w, h = image.size
     new_w = max(1, int(w * (img_height / h)))
+    new_w = min(new_w, 1024)  # cap before multiple rounding
     new_w = pad_width_to_multiple(new_w, width_multiple)
     image = image.resize((new_w, img_height), Image.Resampling.BILINEAR)
     image_tensor = normalize(to_tensor(image))
     ids = tokenizer.encode(formula, max_len=max_len, add_sos_eos=add_sos_eos)
     label_tensor = torch.tensor(ids, dtype=torch.long)
     return (image_tensor, label_tensor)
-
-
+    
 class WebFormulaDataset:
     """
     WebDataset pipeline for Screen2LaTeX: tar shards -> decode images -> resize -> tokenize -> (image, label).
