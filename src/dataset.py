@@ -105,7 +105,7 @@ class WebFormulaDataset:
 
         dataset = (
             wds.WebDataset(self.shards, resampled=False)
-            .shuffle(2000, initial=2000)
+            .shuffle(100, initial=100)
             .decode("pil")
             .to_tuple("jpg", "txt")
             .map(preprocess, handler=wds.handlers.warn_and_continue)
