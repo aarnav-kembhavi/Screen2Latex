@@ -155,7 +155,7 @@ def encode_sample(path_label: Tuple[str, str]):
     try:
         with Image.open(path) as img:
             img = img.convert("RGB")
-            MAX_WIDTH = 2048  # try 1024 if still OOM
+            MAX_WIDTH = 1024  # try 1024 if still OOM
             print("BEFORE:", img.width, flush=True)
 
             if img.width > MAX_WIDTH:
